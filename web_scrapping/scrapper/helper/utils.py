@@ -1,87 +1,51 @@
-# main.py
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+import os
+import sys
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+import re
+import asyncio
+import logging
 from typing import List, Optional
 import httpx
+import inspect
+from urllib.parse import urljoin
 from bs4 import BeautifulSoup
-import asyncio
-from datetime import datetime, timedelta
-import re
-import logging
-from urllib.parse import urljoin, urlparse
-import json
-import os
+from scrapper.models.models import NewsArticle
+from concurrent_log_handler import ConcurrentRotatingFileHandler
+from datetime import datetime
+from scrapper.config.config import INDIAN_NEWS_SOURCES, INTERNATIONAL_NEWS_SOURCES, MIXED_NEWS_SOURCES
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+def setup_logging():
+    logger = logging.getLogger("scraper_log") # create logger
+    if not logger.hasHandlers(): # check if handlers already exist
+        logger.setLevel(logging.INFO) # set log level
 
-app = FastAPI(title="Live News API", description="Fetch latest news from multiple sources", version="1.0.0")
+        # create log directory if it doesn't exist
+        log_dir = "logs"
+        os.makedirs(log_dir, exist_ok=True)
 
-# CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Configure this properly for production
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+        # create a file handler
+        file_handler = ConcurrentRotatingFileHandler(
+            os.path.join(log_dir, "scraper.log"), 
+            maxBytes=10000, # 10KB 
+            backupCount=500
+        )
+        file_handler.setLevel(logging.INFO) # The lock file .__scraper.lock is created here by ConcurrentRotatingFileHandler
 
-# Pydantic models
-class NewsArticle(BaseModel):
-    title: str
-    summary: str
-    url: str
-    published_at: str
-    source: str
-    category: Optional[str] = None
-    image_url: Optional[str] = None
+        #  create a console handler
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
 
-class NewsResponse(BaseModel):
-    articles: List[NewsArticle]
-    total: int
-    last_updated: str
+        # create a formatter
+        formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s - %(pathname)s - %(filename)s - %(lineno)d" , datefmt="%Y-%m-%d %H:%M:%S")
+        file_handler.setFormatter(formatter)
+        console_handler.setFormatter(formatter)
 
-# In-memory cache (use Redis in production)
-news_cache = {
-    "articles": [],
-    "last_updated": None
-}
+        #  add the handlers to the logger
+        logger.addHandler(file_handler)
+        logger.addHandler(console_handler)
+    return logger
 
-# News sources configuration
-NEWS_SOURCES = [
-    {
-        "name": "BBC News",
-        "url": "https://www.bbc.com/news",
-        "selectors": {
-            "articles": "article, .media__content, .gs-c-promo",
-            "title": "h3, .media__title, .gs-c-promo-heading__title",
-            "link": "a",
-            "summary": ".media__summary, .gs-c-promo-summary",
-        }
-    },
-    {
-        "name": "Reuters",
-        "url": "https://www.reuters.com/world/",
-        "selectors": {
-            "articles": "[data-testid='MediaStoryCard'], .story-card",
-            "title": "[data-testid='Heading'], .story-card__headline",
-            "link": "a",
-            "summary": "[data-testid='Body'], .story-card__summary",
-        }
-    },
-    {
-        "name": "CNN",
-        "url": "https://edition.cnn.com/",
-        "selectors": {
-            "articles": ".container__item, .card",
-            "title": ".container__headline, .card__headline",
-            "link": "a",
-            "summary": ".container__summary, .card__summary",
-        }
-    }
-]
+logger = setup_logging()    
 
 class NewsScraperService:
     def __init__(self):
@@ -171,13 +135,14 @@ class NewsScraperService:
                     img_elem = element.find('img')
                     if img_elem and img_elem.get('src'):
                         image_url = self.get_absolute_url(source["url"], img_elem['src'])
-                    
+
                     article = NewsArticle(
                         title=title,
                         summary=summary,
                         url=url,
                         published_at=datetime.now().isoformat(),
                         source=source["name"],
+                        category= "Indian" if source in INDIAN_NEWS_SOURCES else "International",
                         image_url=image_url if image_url else None
                     )
                     articles.append(article)
@@ -195,13 +160,13 @@ class NewsScraperService:
     
     async def scrape_all_sources(self) -> List[NewsArticle]:
         """Scrape news from all configured sources"""
-        tasks = [self.scrape_source(source) for source in NEWS_SOURCES]
+        tasks = [self.scrape_source(source) for source in MIXED_NEWS_SOURCES]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
         all_articles = []
         for i, result in enumerate(results):
             if isinstance(result, Exception):
-                logger.error(f"Error scraping source {NEWS_SOURCES[i]['name']}: {str(result)}")
+                logger.error(f"Error scraping source {MIXED_NEWS_SOURCES[i]['name']}: {str(result)}")
             else:
                 all_articles.extend(result)
         
@@ -217,102 +182,53 @@ class NewsScraperService:
                 unique_articles.append(article)
         
         return unique_articles
-
-# Create scraper instance
-scraper = NewsScraperService()
-
-async def update_news_cache():
-    """Update the news cache with fresh articles"""
-    try:
-        articles = await scraper.scrape_all_sources()
-        news_cache["articles"] = [article.dict() for article in articles]
-        news_cache["last_updated"] = datetime.now().isoformat()
-        logger.info(f"Cache updated with {len(articles)} articles")
-    except Exception as e:
-        logger.error(f"Error updating news cache: {str(e)}")
-
-@app.on_event("startup")
-async def startup_event():
-    """Initialize the news cache on startup"""
-    await update_news_cache()
-
-# API Routes
-@app.get("/", response_model=dict)
-async def root():
-    """Health check endpoint"""
-    return {
-        "message": "Live News API is running",
-        "status": "healthy",
-        "version": "1.0.0"
-    }
-
-@app.get("/news", response_model=NewsResponse)
-async def get_news(
-    limit: Optional[int] = 20,
-    source: Optional[str] = None,
-    refresh: bool = False
-):
-    """
-    Get latest news articles
     
-    - **limit**: Number of articles to return (default: 20, max: 100)
-    - **source**: Filter by news source (optional)
-    - **refresh**: Force refresh of news cache (default: False)
-    """
-    try:
-        # Refresh cache if requested or if cache is older than 30 minutes
-        if (refresh or 
-            not news_cache["last_updated"] or 
-            datetime.now() - datetime.fromisoformat(news_cache["last_updated"]) > timedelta(minutes=30)):
-            await update_news_cache()
+    async def scrape_indian_sources(self) -> List[NewsArticle]:
+        """Scrape news from Indian sources only"""
+        tasks = [self.scrape_source(source) for source in INDIAN_NEWS_SOURCES]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
         
-        articles = news_cache["articles"]
+        indian_articles = []
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                logger.error(f"Error scraping source {INDIAN_NEWS_SOURCES[i]['name']}: {str(result)}")
+            else:
+                indian_articles.extend(result)
         
-        # Filter by source if specified
-        if source:
-            articles = [a for a in articles if a["source"].lower() == source.lower()]
+        # Remove duplicates based on title similarity
+        unique_articles = []
+        seen_titles = set()
         
-        # Apply limit
-        limit = min(limit or 20, 100)
-        articles = articles[:limit]
+        for article in indian_articles:
+            # Create a normalized version of title for comparison
+            normalized_title = re.sub(r'[^\w\s]', '', article.title.lower())
+            if normalized_title not in seen_titles:
+                seen_titles.add(normalized_title)
+                unique_articles.append(article)
         
-        return NewsResponse(
-            articles=[NewsArticle(**article) for article in articles],
-            total=len(articles),
-            last_updated=news_cache["last_updated"] or datetime.now().isoformat()
-        )
+        return unique_articles
     
-    except Exception as e:
-        logger.error(f"Error getting news: {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-@app.get("/news/sources")
-async def get_sources():
-    """Get list of available news sources"""
-    return {
-        "sources": [source["name"] for source in NEWS_SOURCES],
-        "total": len(NEWS_SOURCES)
-    }
-
-@app.post("/news/refresh")
-async def refresh_news(background_tasks: BackgroundTasks):
-    """Manually trigger news cache refresh"""
-    background_tasks.add_task(update_news_cache)
-    return {"message": "News refresh initiated"}
-
-@app.get("/news/stats")
-async def get_stats():
-    """Get API statistics"""
-    return {
-        "total_articles": len(news_cache["articles"]),
-        "last_updated": news_cache["last_updated"],
-        "sources_count": len(NEWS_SOURCES),
-        "cache_age_minutes": (
-            (datetime.now() - datetime.fromisoformat(news_cache["last_updated"])).total_seconds() / 60
-            if news_cache["last_updated"] else None
-        )
-    }
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    async def scrape_international_sources(self) -> List[NewsArticle]:
+        """Scrape news from International sources only"""
+        tasks = [self.scrape_source(source) for source in INTERNATIONAL_NEWS_SOURCES]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        international_articles = []
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                logger.error(f"Error scraping source {INTERNATIONAL_NEWS_SOURCES[i]['name']}: {str(result)}")
+            else:
+                international_articles.extend(result)
+        
+        # Remove duplicates based on title similarity
+        unique_articles = []
+        seen_titles = set()
+        
+        for article in international_articles:
+            # Create a normalized version of title for comparison
+            normalized_title = re.sub(r'[^\w\s]', '', article.title.lower())
+            if normalized_title not in seen_titles:
+                seen_titles.add(normalized_title)
+                unique_articles.append(article)
+        
+        return unique_articles
