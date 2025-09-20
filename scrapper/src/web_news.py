@@ -201,8 +201,4 @@ async def get_international_news(
 async def refresh_news(background_tasks: BackgroundTasks):
     """Manually trigger news cache refresh"""
     background_tasks.add_task(update_all_news_cache)
-    return {"message": "News refresh initiated"}
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(news_router, host="0.0.0.0", port=8000)
+    return {"message": "News refresh command received. Cache will be updated shortly."}
